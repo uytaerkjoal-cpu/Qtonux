@@ -90,3 +90,5 @@ getgenv
 newcclosure
 base64_decode
 debug.getconstants
+
+**The system may think that this is a virus.**
