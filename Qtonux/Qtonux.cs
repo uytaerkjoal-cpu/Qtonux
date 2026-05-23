@@ -18,15 +18,23 @@ public static class API
     private static readonly Qtonux _instance = new Qtonux();
     public static Task Attach() => _instance.Attach();
     public static VelocityState Execute(string script) => _instance.Execute(script);
+
+    public static class Roblox
+    {
+        public static bool Run => _instance.IsRobloxRunning();
+        public static bool Attached => _instance.IsAttached();
+    }
 }
 
 internal class Qtonux : IDisposable
 {
+    private const string BaseDir = "Bin\\Velocity";
     private const string VersionUrl = "https://realvelocity.xyz/assets/current_version.txt";
     private const string LinksUrl = "https://realvelocity.xyz/assets/download_links.json";
-    private const string InjectExe = "Bin\\erto3e4rortoergn.exe";
-    private const string DecompExe = "Bin\\Decompiler.exe";
-    private const string VersionFile = "Bin\\current_version.txt";
+
+    private readonly string InjectExe = Path.Combine(BaseDir, "erto3e4rortoergn.exe");
+    private readonly string DecompExe = Path.Combine(BaseDir, "Decompiler.exe");
+    private readonly string VersionFile = Path.Combine(BaseDir, "current_version.txt");
 
     private readonly HttpClient _http = new HttpClient();
     private readonly List<int> _pids = new List<int>();
@@ -37,37 +45,47 @@ internal class Qtonux : IDisposable
 
     public Qtonux()
     {
-        foreach (string dir in new[] { "Bin", "AutoExec", "Workspace", "Scripts" })
-            Directory.CreateDirectory(dir);
+        Directory.CreateDirectory(BaseDir);
+        foreach (string dir in new[] { "AutoExec", "Workspace", "Scripts" })
+            Directory.CreateDirectory(Path.Combine(BaseDir, dir));
 
         AutoUpdate();
 
-        _decompiler = new Process
+        if (File.Exists(DecompExe))
         {
-            StartInfo = new ProcessStartInfo(DecompExe)
+            _decompiler = new Process
             {
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardInput = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-            },
-            EnableRaisingEvents = true
-        };
-        _decompiler.Start();
+                StartInfo = new ProcessStartInfo(DecompExe)
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardInput = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                },
+                EnableRaisingEvents = true
+            };
+            _decompiler.Start();
+        }
 
         _timer = new System.Timers.Timer(100);
         _timer.Elapsed += OnTick;
         _timer.Start();
     }
 
+    public bool IsRobloxRunning() => FindRobloxPid() != -1;
+
+    public bool IsAttached()
+    {
+        lock (_pidLock) return _pids.Count > 0;
+    }
+
     public async Task Attach()
     {
         int pid = FindRobloxPid();
-        if (pid == -1) return;
+        if (pid == -1 || !File.Exists(InjectExe)) return;
 
-        lock (_pidLock)
-            if (_pids.Contains(pid)) return;
+        lock (_pidLock) if (_pids.Contains(pid)) return;
 
         await Task.Run(() =>
         {
@@ -76,12 +94,9 @@ internal class Qtonux : IDisposable
                 Process p = Process.Start(new ProcessStartInfo(InjectExe, pid.ToString())
                 {
                     UseShellExecute = false,
-                    CreateNoWindow = true,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
+                    CreateNoWindow = true
                 });
                 p?.WaitForExit();
-
                 lock (_pidLock) _pids.Add(pid);
             }
             catch { }
@@ -96,36 +111,30 @@ internal class Qtonux : IDisposable
         if (snapshot.Count == 0) return VelocityState.NotAttached;
 
         string encoded = Convert.ToBase64String(Encoding.UTF8.GetBytes(script));
-        foreach (int pid in snapshot)
-            LuaPipe.Send(encoded, pid);
+        foreach (int pid in snapshot) LuaPipe.Send(encoded, pid);
 
         return VelocityState.Executed;
     }
 
-    private static int FindRobloxPid()
-    {
-        return Process.GetProcessesByName("RobloxPlayerBeta")
-                      .FirstOrDefault()?.Id ?? -1;
-    }
+    private static int FindRobloxPid() => Process.GetProcessesByName("RobloxPlayerBeta").FirstOrDefault()?.Id ?? -1;
 
     private void OnTick(object src, ElapsedEventArgs e)
     {
+        lock (_pidLock) _pids.RemoveAll(pid => !IsRunning(pid));
+
+        string workspacePath = Path.Combine(Directory.GetCurrentDirectory(), BaseDir, "Workspace");
+        string workspaceCmd = Convert.ToBase64String(Encoding.UTF8.GetBytes("setworkspacefolder: " + workspacePath));
+
         lock (_pidLock)
-            _pids.RemoveAll(pid => !IsRunning(pid));
-
-        string workspace = Convert.ToBase64String(
-            Encoding.UTF8.GetBytes("setworkspacefolder: " + Directory.GetCurrentDirectory() + "\\Workspace"));
-
-        List<int> snapshot;
-        lock (_pidLock) snapshot = new List<int>(_pids);
-        foreach (int pid in snapshot)
-            LuaPipe.Send(workspace, pid);
+        {
+            foreach (int pid in _pids) LuaPipe.Send(workspaceCmd, pid);
+        }
     }
 
     private static bool IsRunning(int pid)
     {
         try { Process.GetProcessById(pid); return true; }
-        catch (ArgumentException) { return false; }
+        catch { return false; }
     }
 
     private void AutoUpdate()
@@ -143,16 +152,15 @@ internal class Qtonux : IDisposable
             {
                 DownloadTo(url2, InjectExe);
                 DownloadTo(url1, DecompExe);
+                File.WriteAllText(VersionFile, remote);
             }
-            File.WriteAllText(VersionFile, remote);
         }
         catch { }
     }
 
     private void DownloadTo(string url, string path)
     {
-        if (File.Exists(path)) File.Delete(path);
-        File.WriteAllBytes(path, _http.GetByteArrayAsync(url).Result);
+        try { File.WriteAllBytes(path, _http.GetByteArrayAsync(url).Result); } catch { }
     }
 
     private static string ExtractJson(string json, string key)
@@ -164,11 +172,9 @@ internal class Qtonux : IDisposable
     public void Dispose()
     {
         _timer?.Stop();
-        _timer = null;
+        _timer?.Dispose();
         try { _decompiler?.Kill(); } catch { }
         _decompiler?.Dispose();
-        _decompiler = null;
-        lock (_pidLock) _pids.Clear();
     }
 }
 
@@ -203,7 +209,7 @@ internal static class LuaPipe
             {
                 using (NamedPipeClientStream pipe = new NamedPipeClientStream(".", PipeName + "_" + pid, PipeDirection.Out))
                 {
-                    pipe.Connect();
+                    pipe.Connect(1000);
                     using (StreamWriter writer = new StreamWriter(pipe, Encoding.Default, 999999))
                     {
                         writer.Write(script);
@@ -228,7 +234,6 @@ internal static class AesGcm
     [DllImport("bcrypt.dll")] static extern uint BCryptGenerateSymmetricKey(IntPtr hAlg, out IntPtr hKey, IntPtr obj, uint objLen, byte[] secret, uint secretLen, uint flags);
     [DllImport("bcrypt.dll")] static extern uint BCryptDestroyKey(IntPtr hKey);
     [DllImport("bcrypt.dll", CharSet = CharSet.Unicode)] static extern uint BCryptSetProperty(IntPtr hObj, string prop, byte[] input, uint inputLen, uint flags);
-    [DllImport("bcrypt.dll")] static extern uint BCryptEncrypt(IntPtr hKey, byte[] input, uint inputLen, ref AuthInfo info, byte[] iv, uint ivLen, byte[] output, uint outputLen, out uint result, uint flags);
     [DllImport("bcrypt.dll")] static extern uint BCryptDecrypt(IntPtr hKey, byte[] input, uint inputLen, ref AuthInfo info, byte[] iv, uint ivLen, byte[] output, uint outputLen, out uint result, uint flags);
 
     [StructLayout(LayoutKind.Sequential)]
