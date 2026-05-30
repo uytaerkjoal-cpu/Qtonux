@@ -16,6 +16,8 @@ using System.Timers;
 public static class API
 {
     private static readonly Qtonux _instance = new Qtonux();
+
+    public static void AutoAttach() => _instance.SetAutoAttach();
     public static Task Attach() => _instance.Attach();
     public static VelocityState Execute(string script) => _instance.Execute(script);
 
@@ -23,12 +25,42 @@ public static class API
     {
         public static bool Run => _instance.IsRobloxRunning();
         public static bool Attached => _instance.IsAttached();
+        public static void Kill() => _instance.KillRoblox();
+
+        // Событие для получения логов. Формат строки: "[Тип] [Время]: Сообщение"
+        public static event Action<string> Log;
+
+        internal static void RaiseLog(string message, string type, string timestamp)
+        {
+            if (string.IsNullOrEmpty(type))
+            {
+                // Если тип не указан (например, стек вызовов), выводим строку сырой
+                Log?.Invoke(message);
+            }
+            else if (string.IsNullOrEmpty(timestamp))
+            {
+                Log?.Invoke($"[{type}] {message}");
+            }
+            else
+            {
+                Log?.Invoke($"[{type}] [{timestamp}]: {message}");
+            }
+        }
     }
+}
+
+public enum VelocityState { Attaching, Attached, NotAttached, NoProcessFound, TamperDetected, Error, Executed }
+
+public class DownloadUrlData
+{
+    public string L1 { get; set; }
+    public string L2 { get; set; }
+    public string question { get; set; }
 }
 
 internal class Qtonux : IDisposable
 {
-    private const string BaseDir = "Bin\\Velocity";
+    private const string BaseDir = @"Bin\Velocity";
     private const string VersionUrl = "https://realvelocity.xyz/assets/current_version.txt";
     private const string LinksUrl = "https://realvelocity.xyz/assets/download_links.json";
 
@@ -40,16 +72,34 @@ internal class Qtonux : IDisposable
     private readonly List<int> _pids = new List<int>();
     private readonly object _pidLock = new object();
 
+    private bool _autoAttachEnabled = false;
+    private bool _isAttaching = false;
+
     private Process _decompiler;
     private System.Timers.Timer _timer;
+
+    // Поля для фонового чтения перехваченных логов
+    private readonly CancellationTokenSource _cts = new CancellationTokenSource();
+    private readonly string _logFileName;
+    private readonly string _logFile;
+    private long _lastPosition = 0;
 
     public Qtonux()
     {
         Directory.CreateDirectory(BaseDir);
         foreach (string dir in new[] { "AutoExec", "Workspace", "Scripts" })
+        {
             Directory.CreateDirectory(Path.Combine(BaseDir, dir));
+        }
 
-        AutoUpdate();
+        // Генерируем уникальное имя файла для этой сессии (избегая символа ':' для совместимости с Windows)
+        _logFileName = $"log_{DateTime.Now:dd.MM.yyyy_HH.mm.ss.fff}.log";
+        _logFile = Path.Combine(BaseDir, "Workspace", _logFileName);
+
+        // Перезаписываем Lua-логгер в автовыполнении с актуальным уникальным именем лога
+        CreateLuaLogger(_logFileName);
+
+        Task.Run(() => AutoUpdate()).Wait();
 
         if (File.Exists(DecompExe))
         {
@@ -62,23 +112,68 @@ internal class Qtonux : IDisposable
                     RedirectStandardInput = true,
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
+                    WorkingDirectory = Path.GetFullPath(BaseDir)
                 },
                 EnableRaisingEvents = true
             };
-            _decompiler.Start();
+            try { _decompiler.Start(); } catch { }
         }
 
         _timer = new System.Timers.Timer(100);
         _timer.Elapsed += OnTick;
         _timer.Start();
+
+        // Запуск асинхронного чтения чистого файла логов
+        StartLogReader(_cts.Token);
+    }
+
+    // Создание логгера на стороне Lua
+    private void CreateLuaLogger(string logFileName)
+    {
+        string autoExecPath = Path.Combine(BaseDir, "AutoExec", "velocity_logger.lua");
+
+        string luaCode = $@"-- Auto-generated logger for Velocity console
+local LogService = game:GetService('LogService')
+local filename = '{logFileName}'
+
+pcall(function()
+    writefile(filename, '')
+end)
+
+local function getTimeString()
+    local t = DateTime.now().UnixTimestampMillis
+    local ms = string.format('%03d', t % 1000)
+    local timePart = os.date('%H:%M:%S')
+    return timePart .. ':' .. ms
+end
+
+LogService.MessageOut:Connect(function(message, messageType)
+    local prefix = 'Output'
+    if messageType == Enum.MessageType.MessageWarning then
+        prefix = 'Warning'
+    elseif messageType == Enum.MessageType.MessageError then
+        prefix = 'Error'
+    elseif messageType == Enum.MessageType.MessageInfo then
+        prefix = 'Info'
+    end
+    pcall(function()
+        local timeStr = getTimeString()
+        appendfile(filename, '[' .. prefix .. '] [' .. timeStr .. ']: ' .. message .. '\n')
+    end)
+end)";
+        try { File.WriteAllText(autoExecPath, luaCode); } catch { }
     }
 
     public bool IsRobloxRunning() => FindRobloxPid() != -1;
+    public bool IsAttached() { lock (_pidLock) return _pids.Count > 0; }
 
-    public bool IsAttached()
+    public void KillRoblox()
     {
-        lock (_pidLock) return _pids.Count > 0;
+        foreach (var p in Process.GetProcessesByName("RobloxPlayerBeta"))
+            try { p.Kill(); } catch { }
     }
+
+    public void SetAutoAttach() => _autoAttachEnabled = true;
 
     public async Task Attach()
     {
@@ -87,20 +182,34 @@ internal class Qtonux : IDisposable
 
         lock (_pidLock) if (_pids.Contains(pid)) return;
 
-        await Task.Run(() =>
+        if (_isAttaching) return;
+        _isAttaching = true;
+
+        try
         {
-            try
+            await Task.Run(() =>
             {
-                Process p = Process.Start(new ProcessStartInfo(InjectExe, pid.ToString())
+                using (Process p = Process.Start(new ProcessStartInfo(InjectExe, pid.ToString())
                 {
                     UseShellExecute = false,
-                    CreateNoWindow = true
-                });
-                p?.WaitForExit();
-                lock (_pidLock) _pids.Add(pid);
-            }
-            catch { }
-        });
+                    CreateNoWindow = true,
+                    WorkingDirectory = Path.GetFullPath(BaseDir)
+                }))
+                {
+                    p?.WaitForExit();
+                }
+
+                lock (_pidLock)
+                {
+                    if (!_pids.Contains(pid)) _pids.Add(pid);
+                }
+            });
+        }
+        catch { }
+        finally
+        {
+            _isAttaching = false;
+        }
     }
 
     public VelocityState Execute(string script)
@@ -111,7 +220,10 @@ internal class Qtonux : IDisposable
         if (snapshot.Count == 0) return VelocityState.NotAttached;
 
         string encoded = Convert.ToBase64String(Encoding.UTF8.GetBytes(script));
-        foreach (int pid in snapshot) LuaPipe.Send(encoded, pid);
+        foreach (int pid in snapshot)
+        {
+            coms.NamedPipes.LuaPipe(encoded, pid);
+        }
 
         return VelocityState.Executed;
     }
@@ -120,14 +232,33 @@ internal class Qtonux : IDisposable
 
     private void OnTick(object src, ElapsedEventArgs e)
     {
-        lock (_pidLock) _pids.RemoveAll(pid => !IsRunning(pid));
-
-        string workspacePath = Path.Combine(Directory.GetCurrentDirectory(), BaseDir, "Workspace");
-        string workspaceCmd = Convert.ToBase64String(Encoding.UTF8.GetBytes("setworkspacefolder: " + workspacePath));
-
-        lock (_pidLock)
+        _timer.Stop();
+        try
         {
-            foreach (int pid in _pids) LuaPipe.Send(workspaceCmd, pid);
+            lock (_pidLock) _pids.RemoveAll(pid => !IsRunning(pid));
+
+            if (_autoAttachEnabled && IsRobloxRunning() && !IsAttached())
+            {
+                _ = Attach();
+            }
+
+            if (IsAttached())
+            {
+                string workspacePath = Path.GetFullPath(Path.Combine(BaseDir, "Workspace"));
+                string workspaceCmd = Convert.ToBase64String(Encoding.UTF8.GetBytes("setworkspacefolder: " + workspacePath));
+
+                List<int> snapshot;
+                lock (_pidLock) snapshot = new List<int>(_pids);
+
+                foreach (int pid in snapshot)
+                {
+                    coms.NamedPipes.LuaPipe(workspaceCmd, pid);
+                }
+            }
+        }
+        finally
+        {
+            _timer.Start();
         }
     }
 
@@ -137,40 +268,118 @@ internal class Qtonux : IDisposable
         catch { return false; }
     }
 
-    private void AutoUpdate()
+    private async Task AutoUpdate()
     {
         try
         {
-            string json = _http.GetStringAsync(LinksUrl).Result;
-            string key = ExtractJson(json, "question");
-            string url1 = AesGcm.Decrypt(ExtractJson(json, "L1"), key);
-            string url2 = AesGcm.Decrypt(ExtractJson(json, "L2"), key);
-            string remote = _http.GetStringAsync(VersionUrl).Result;
+            string json = await _http.GetStringAsync(LinksUrl);
+            DownloadUrlData data = ParseJson(json);
+
+            string key = data.question;
+            string url1 = AesGcm.Decrypt(data.L1, key);
+            string url2 = AesGcm.Decrypt(data.L2, key);
+
+            string remote = await _http.GetStringAsync(VersionUrl);
             string local = File.Exists(VersionFile) ? File.ReadAllText(VersionFile) : "";
 
             if (remote != local)
             {
-                DownloadTo(url2, InjectExe);
-                DownloadTo(url1, DecompExe);
+                if (File.Exists(InjectExe)) File.Delete(InjectExe);
+                if (File.Exists(DecompExe)) File.Delete(DecompExe);
+
+                await DownloadTo(url2, InjectExe);
+                await DownloadTo(url1, DecompExe);
                 File.WriteAllText(VersionFile, remote);
             }
         }
         catch { }
     }
 
-    private void DownloadTo(string url, string path)
+    private async Task DownloadTo(string url, string path)
     {
-        try { File.WriteAllBytes(path, _http.GetByteArrayAsync(url).Result); } catch { }
+        try { File.WriteAllBytes(path, await _http.GetByteArrayAsync(url)); } catch { }
     }
 
-    private static string ExtractJson(string json, string key)
+    private static DownloadUrlData ParseJson(string json)
+    {
+        var data = new DownloadUrlData();
+        data.L1 = GetJsonValue(json, "L1");
+        data.L2 = GetJsonValue(json, "L2");
+        data.question = GetJsonValue(json, "question");
+        return data;
+    }
+
+    private static string GetJsonValue(string json, string key)
     {
         var m = Regex.Match(json, "\"" + Regex.Escape(key) + "\"\\s*:\\s*\"(.*?)\"");
         return m.Success ? m.Groups[1].Value : null;
     }
 
+    // --- Логика чтения файла логов ---
+
+    private void StartLogReader(CancellationToken token)
+    {
+        Task.Run(async () =>
+        {
+            while (!token.IsCancellationRequested)
+            {
+                try
+                {
+                    CheckAndReadLogs();
+                }
+                catch { }
+                await Task.Delay(100, token);
+            }
+        }, token);
+    }
+
+    private void CheckAndReadLogs()
+    {
+        if (!File.Exists(_logFile)) return;
+
+        var fi = new FileInfo(_logFile);
+        if (fi.Length > _lastPosition)
+        {
+            using (var fs = new FileStream(_logFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            {
+                fs.Seek(_lastPosition, SeekOrigin.Begin);
+                using (var reader = new StreamReader(fs, Encoding.UTF8))
+                {
+                    string line;
+                    while ((line = reader.ReadLine()) != null)
+                    {
+                        if (string.IsNullOrEmpty(line)) continue;
+
+                        // Шаблон для поиска формата "[Тип] [Время]: Сообщение"
+                        var match = Regex.Match(line, @"^\[(.*?)\]\s*\[(.*?)\]:\s*(.*)$");
+                        if (match.Success)
+                        {
+                            string type = match.Groups[1].Value;       // "Output", "Warning", "Error", "Info"
+                            string timestamp = match.Groups[2].Value;  // "16:33:12:012"
+                            string message = match.Groups[3].Value;    // Само сообщение
+
+                            API.Roblox.RaiseLog(message, type, timestamp);
+                        }
+                        else
+                        {
+                            // Оставляем строки без разметки сырыми (например, продолжение многострочного Stack Trace)
+                            API.Roblox.RaiseLog(line, "", "");
+                        }
+                    }
+                    _lastPosition = fs.Position;
+                }
+            }
+        }
+        else if (fi.Length < _lastPosition)
+        {
+            _lastPosition = 0; // Сброс позиции, если файл был перезаписан
+        }
+    }
+
     public void Dispose()
     {
+        _cts.Cancel();
+        _cts.Dispose();
         _timer?.Stop();
         _timer?.Dispose();
         try { _decompiler?.Kill(); } catch { }
@@ -178,46 +387,56 @@ internal class Qtonux : IDisposable
     }
 }
 
-public enum VelocityState { Attaching, Attached, NotAttached, NoProcessFound, TamperDetected, Error, Executed }
-
-internal static class LuaPipe
+namespace coms
 {
-    private const string PipeName = "uoQcySKXSUxxJNpVQyatpHQwYoGfhcbh";
-
-    [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool WaitNamedPipe(string name, int timeout);
-
-    private static bool PipeExists(int pid)
+    internal static class NamedPipes
     {
-        try
-        {
-            bool ok = WaitNamedPipe("\\\\.\\pipe\\" + PipeName + "_" + pid, 0);
-            if (ok) return true;
-            int err = Marshal.GetLastWin32Error();
-            return err != 0 && err != 2;
-        }
-        catch { return false; }
-    }
+        private static readonly string luapipename = "uoQcySKXSUxxJNpVQyatpHQwYoGfhcbh";
 
-    public static void Send(string script, int pid)
-    {
-        if (!PipeExists(pid)) return;
-        new Thread(delegate ()
+        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool WaitNamedPipe(string name, int timeout);
+
+        public static bool NamedPipeExist(string pipeName)
         {
             try
             {
-                using (NamedPipeClientStream pipe = new NamedPipeClientStream(".", PipeName + "_" + pid, PipeDirection.Out))
+                string fullPath = "\\\\.\\pipe\\" + pipeName;
+                if (WaitNamedPipe(fullPath, 0)) return true;
+
+                int err = Marshal.GetLastWin32Error();
+                if (err == 0) return false;
+                if (err == 2) return false;
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        public static void LuaPipe(string script, int pid)
+        {
+            string pipeName = $"{luapipename}_{pid}";
+
+            if (!NamedPipeExist(pipeName)) return;
+
+            Task.Run(() =>
+            {
+                try
                 {
-                    pipe.Connect(1000);
-                    using (StreamWriter writer = new StreamWriter(pipe, Encoding.Default, 999999))
+                    using (var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.Out))
                     {
-                        writer.Write(script);
+                        pipe.Connect(50);
+                        using (var writer = new StreamWriter(pipe, Encoding.Default, 999999))
+                        {
+                            writer.Write(script);
+                        }
                     }
                 }
-            }
-            catch { }
-        }).Start();
+                catch { }
+            });
+        }
     }
 }
 
@@ -229,12 +448,23 @@ internal static class AesGcm
     private const int TagSize = 16;
     private const int Iterations = 100000;
 
-    [DllImport("bcrypt.dll", CharSet = CharSet.Unicode)] static extern uint BCryptOpenAlgorithmProvider(out IntPtr hAlg, string algId, string impl, uint flags);
-    [DllImport("bcrypt.dll")] static extern uint BCryptCloseAlgorithmProvider(IntPtr hAlg, uint flags);
-    [DllImport("bcrypt.dll")] static extern uint BCryptGenerateSymmetricKey(IntPtr hAlg, out IntPtr hKey, IntPtr obj, uint objLen, byte[] secret, uint secretLen, uint flags);
-    [DllImport("bcrypt.dll")] static extern uint BCryptDestroyKey(IntPtr hKey);
-    [DllImport("bcrypt.dll", CharSet = CharSet.Unicode)] static extern uint BCryptSetProperty(IntPtr hObj, string prop, byte[] input, uint inputLen, uint flags);
-    [DllImport("bcrypt.dll")] static extern uint BCryptDecrypt(IntPtr hKey, byte[] input, uint inputLen, ref AuthInfo info, byte[] iv, uint ivLen, byte[] output, uint outputLen, out uint result, uint flags);
+    [DllImport("bcrypt.dll", CharSet = CharSet.Unicode)]
+    static extern uint BCryptOpenAlgorithmProvider(out IntPtr hAlg, string algId, string impl, uint flags);
+
+    [DllImport("bcrypt.dll")]
+    static extern uint BCryptCloseAlgorithmProvider(IntPtr hAlg, uint flags);
+
+    [DllImport("bcrypt.dll")]
+    static extern uint BCryptGenerateSymmetricKey(IntPtr hAlg, out IntPtr hKey, IntPtr obj, uint objLen, byte[] secret, uint secretLen, uint flags);
+
+    [DllImport("bcrypt.dll")]
+    static extern uint BCryptDestroyKey(IntPtr hKey);
+
+    [DllImport("bcrypt.dll", CharSet = CharSet.Unicode)]
+    static extern uint BCryptSetProperty(IntPtr hObj, string prop, byte[] input, uint inputLen, uint flags);
+
+    [DllImport("bcrypt.dll", CharSet = CharSet.Unicode)]
+    static extern uint BCryptDecrypt(IntPtr hKey, byte[] input, uint inputLen, ref AuthInfo info, byte[] iv, uint ivLen, byte[] output, uint outputLen, out uint result, uint flags);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct AuthInfo
@@ -309,7 +539,6 @@ internal static class AesGcm
             int bLen = hmac.HashSize / 8;
             int blocks = (int)Math.Ceiling((double)KeySize / bLen);
             byte[] derived = new byte[blocks * bLen];
-
             for (int i = 1; i <= blocks; i++)
             {
                 byte[] u = new byte[salt.Length + 4];
@@ -317,7 +546,6 @@ internal static class AesGcm
                 byte[] iBytes = BitConverter.GetBytes(i);
                 if (BitConverter.IsLittleEndian) Array.Reverse(iBytes);
                 Buffer.BlockCopy(iBytes, 0, u, salt.Length, 4);
-
                 byte[] prev = hmac.ComputeHash(u);
                 byte[] xored = (byte[])prev.Clone();
                 for (int j = 1; j < Iterations; j++)
