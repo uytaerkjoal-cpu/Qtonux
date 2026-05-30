@@ -27,14 +27,12 @@ public static class API
         public static bool Attached => _instance.IsAttached();
         public static void Kill() => _instance.KillRoblox();
 
-        // Событие для получения логов. Формат строки: "[Тип] [Время]: Сообщение"
         public static event Action<string> Log;
 
         internal static void RaiseLog(string message, string type, string timestamp)
         {
             if (string.IsNullOrEmpty(type))
             {
-                // Если тип не указан (например, стек вызовов), выводим строку сырой
                 Log?.Invoke(message);
             }
             else if (string.IsNullOrEmpty(timestamp))
@@ -78,7 +76,6 @@ internal class Qtonux : IDisposable
     private Process _decompiler;
     private System.Timers.Timer _timer;
 
-    // Поля для фонового чтения перехваченных логов
     private readonly CancellationTokenSource _cts = new CancellationTokenSource();
     private readonly string _logFileName;
     private readonly string _logFile;
@@ -92,11 +89,9 @@ internal class Qtonux : IDisposable
             Directory.CreateDirectory(Path.Combine(BaseDir, dir));
         }
 
-        // Генерируем уникальное имя файла для этой сессии (избегая символа ':' для совместимости с Windows)
         _logFileName = $"log_{DateTime.Now:dd.MM.yyyy_HH.mm.ss.fff}.log";
         _logFile = Path.Combine(BaseDir, "Workspace", _logFileName);
 
-        // Перезаписываем Lua-логгер в автовыполнении с актуальным уникальным именем лога
         CreateLuaLogger(_logFileName);
 
         Task.Run(() => AutoUpdate()).Wait();
@@ -123,11 +118,9 @@ internal class Qtonux : IDisposable
         _timer.Elapsed += OnTick;
         _timer.Start();
 
-        // Запуск асинхронного чтения чистого файла логов
         StartLogReader(_cts.Token);
     }
 
-    // Создание логгера на стороне Lua
     private void CreateLuaLogger(string logFileName)
     {
         string autoExecPath = Path.Combine(BaseDir, "AutoExec", "velocity_logger.lua");
@@ -315,8 +308,6 @@ end)";
         return m.Success ? m.Groups[1].Value : null;
     }
 
-    // --- Логика чтения файла логов ---
-
     private void StartLogReader(CancellationToken token)
     {
         Task.Run(async () =>
@@ -349,20 +340,18 @@ end)";
                     while ((line = reader.ReadLine()) != null)
                     {
                         if (string.IsNullOrEmpty(line)) continue;
-
-                        // Шаблон для поиска формата "[Тип] [Время]: Сообщение"
+                        
                         var match = Regex.Match(line, @"^\[(.*?)\]\s*\[(.*?)\]:\s*(.*)$");
                         if (match.Success)
                         {
-                            string type = match.Groups[1].Value;       // "Output", "Warning", "Error", "Info"
-                            string timestamp = match.Groups[2].Value;  // "16:33:12:012"
-                            string message = match.Groups[3].Value;    // Само сообщение
+                            string type = match.Groups[1].Value;     
+                            string timestamp = match.Groups[2].Value;
+                            string message = match.Groups[3].Value;
 
                             API.Roblox.RaiseLog(message, type, timestamp);
                         }
                         else
                         {
-                            // Оставляем строки без разметки сырыми (например, продолжение многострочного Stack Trace)
                             API.Roblox.RaiseLog(line, "", "");
                         }
                     }
@@ -372,7 +361,7 @@ end)";
         }
         else if (fi.Length < _lastPosition)
         {
-            _lastPosition = 0; // Сброс позиции, если файл был перезаписан
+            _lastPosition = 0;
         }
     }
 
